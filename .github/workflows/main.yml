@@ -1,0 +1,300 @@
+
+name: IPUL RDP GENERATOR
+
+"on":
+  workflow_dispatch:
+    inputs:
+      os_choice:
+        description: "Pilih OS"
+        required: true
+        type: choice
+        options:
+          - auto
+          - windows11
+          - windows10
+        default: auto
+
+      username:
+        description: "Buat username RDP"
+        required: true
+        type: string
+        default: ipul
+
+      password:
+        description: "Buat password RDP"
+        required: true
+        type: string
+
+      tailscale_key:
+        description: "Tempel Tailscale Auth Key Windows 11"
+        required: false
+        type: string
+
+      ngrok_key:
+        description: "Tempel Ngrok Auth Token Windows 10"
+        required: false
+        type: string
+
+      confirm:
+        description: "Konfirmasi pembuatan RDP"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  create-rdp:
+    name: IPUL RDP SETUP
+    runs-on: [self-hosted, Windows, X64]
+
+    if: ${{ inputs.confirm }}
+
+    steps:
+      - name: Create Windows RDP
+        shell: pwsh
+
+        env:
+          OS_CHOICE: ${{ inputs.os_choice }}
+          RDP_USERNAME: ${{ inputs.username }}
+          RDP_PASSWORD: ${{ inputs.password }}
+          TS_AUTHKEY: ${{ inputs.tailscale_key }}
+          NGROK_AUTHTOKEN: ${{ inputs.ngrok_key }}
+
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "================================"
+          Write-Host "       IPUL RDP GENERATOR"
+          Write-Host "================================"
+
+          # MASK CREDENTIALS IN LOGS
+          foreach ($secret in @(
+            $env:RDP_PASSWORD,
+            $env:TS_AUTHKEY,
+            $env:NGROK_AUTHTOKEN
+          )) {
+            if (![string]::IsNullOrEmpty($secret)) {
+              Write-Output "::add-mask::$secret"
+            }
+          }
+
+          # DETECT WINDOWS
+          $os = (Get-CimInstance Win32_OperatingSystem).Caption
+          Write-Host "OS detected: $os"
+
+          if ($env:OS_CHOICE -eq "auto") {
+            if ($os -match "Windows 11") {
+              $mode = "windows11"
+            }
+            elseif ($os -match "Windows 10") {
+              $mode = "windows10"
+            }
+            else {
+              throw "Windows 10/11 tidak terdeteksi"
+            }
+          }
+          else {
+            $mode = $env:OS_CHOICE
+
+            if ($mode -eq "windows11" -and $os -notmatch "Windows 11") {
+              throw "VPS bukan Windows 11"
+            }
+
+            if ($mode -eq "windows10" -and $os -notmatch "Windows 10") {
+              throw "VPS bukan Windows 10"
+            }
+          }
+
+          # CHECK INPUT
+          $username = $env:RDP_USERNAME
+          $plainPassword = $env:RDP_PASSWORD
+
+          if ($username -notmatch '^[a-zA-Z0-9._-]{3,20}$') {
+            throw "Username tidak valid"
+          }
+
+          if ([string]::IsNullOrWhiteSpace($plainPassword) -or $plainPassword.Length -lt 12) {
+            throw "Password minimal 12 karakter"
+          }
+
+          # CHECK PROVIDER KEY
+          if ($mode -eq "windows11" -and !$env:TS_AUTHKEY) {
+            throw "Tailscale Key belum diisi"
+          }
+
+          if ($mode -eq "windows10" -and !$env:NGROK_AUTHTOKEN) {
+            throw "Ngrok Key belum diisi"
+          }
+
+          # CREATE USER
+          $securePassword = ConvertTo-SecureString $plainPassword -AsPlainText -Force
+          $plainPassword = $null
+
+          $existing = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+
+          if ($existing) {
+            Set-LocalUser -Name $username -Password $securePassword
+          }
+          else {
+            New-LocalUser -Name $username -Password $securePassword
+          }
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $username `
+            -ErrorAction SilentlyContinue
+
+          # ENABLE RDP
+          Write-Host "Mengaktifkan RDP..."
+
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+            -Name fDenyTSConnections -Value 0
+
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name UserAuthentication -Value 1
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          Set-Service TermService -StartupType Automatic
+          Start-Service TermService
+
+          # WINDOWS 11 - TAILSCALE
+          if ($mode -eq "windows11") {
+
+            Write-Host "Installing Tailscale..."
+
+            $msi = "$env:TEMP\tailscale.msi"
+
+            Invoke-WebRequest `
+              "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+              -OutFile $msi
+
+            $install = Start-Process msiexec.exe `
+              -ArgumentList "/i `"$msi`" /qn /norestart" `
+              -Wait -PassThru
+
+            if ($install.ExitCode -notin @(0,3010)) {
+              throw "Tailscale installation failed"
+            }
+
+            $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+            if (!(Test-Path $tailscale)) {
+              throw "Tailscale tidak ditemukan"
+            }
+
+            & $tailscale up `
+              "--authkey=$env:TS_AUTHKEY" `
+              "--hostname=ipul-rdp-win11"
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Tailscale connection failed"
+            }
+
+            Start-Sleep -Seconds 5
+
+            $endpoint = (& $tailscale ip -4 | Select-Object -First 1).Trim()
+
+            if (!$endpoint) {
+              throw "IP Tailscale tidak ditemukan"
+            }
+
+            $provider = "Tailscale"
+
+          }
+
+          # WINDOWS 10 - NGROK
+          elseif ($mode -eq "windows10") {
+
+            Write-Host "Installing Ngrok..."
+
+            $folder = "$env:ProgramData\IPUL-RDP"
+            $zip = "$env:TEMP\ngrok.zip"
+
+            New-Item -ItemType Directory -Path $folder -Force | Out-Null
+
+            Invoke-WebRequest `
+              "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" `
+              -OutFile $zip
+
+            Expand-Archive $zip $folder -Force
+
+            $ngrok = "$folder\ngrok.exe"
+
+            & $ngrok config add-authtoken $env:NGROK_AUTHTOKEN
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Ngrok token tidak valid"
+            }
+
+            Get-Process ngrok -ErrorAction SilentlyContinue |
+              Stop-Process -Force
+
+            Start-Process $ngrok `
+              -ArgumentList "tcp 3389 --log=stdout" `
+              -WindowStyle Hidden
+
+            $tunnel = $null
+
+            for ($i = 0; $i -lt 30; $i++) {
+              Start-Sleep -Seconds 2
+
+              try {
+                $api = Invoke-RestMethod `
+                  "http://127.0.0.1:4040/api/tunnels" `
+                  -TimeoutSec 3
+
+                $tunnel = $api.tunnels |
+                  Where-Object { $_.proto -eq "tcp" } |
+                  Select-Object -First 1
+
+                if ($tunnel) {
+                  break
+                }
+              }
+              catch {}
+            }
+
+            if (!$tunnel) {
+              throw "Ngrok tunnel gagal dibuat"
+            }
+
+            $endpoint = $tunnel.public_url -replace '^tcp://',''
+            $provider = "Ngrok TCP"
+          }
+
+          # OUTPUT
+          Write-Host ""
+          Write-Host "================================"
+          Write-Host "        RDP BERHASIL"
+          Write-Host "================================"
+          Write-Host "OS       : $os"
+          Write-Host "Provider : $provider"
+          Write-Host "Address  : $endpoint"
+          Write-Host "Username : $username"
+          Write-Host "Password : Tersimpan saat setup"
+          Write-Host "Port     : 3389"
+          Write-Host "================================"
+
+          @"
+          # IPUL RDP GENERATOR
+
+          - OS: $os
+          - Provider: $provider
+          - Address: $endpoint
+          - Username: $username
+          - Port: 3389
+
+          Password: gunakan password yang dibuat saat setup.
+          "@ | Out-File $env:GITHUB_STEP_SUMMARY -Encoding utf8
+
+          # CLEAR CREDENTIALS
+          Remove-Item Env:RDP_PASSWORD -ErrorAction SilentlyContinue
+          Remove-Item Env:TS_AUTHKEY -ErrorAction SilentlyContinue
+          Remove-Item Env:NGROK_AUTHTOKEN -ErrorAction SilentlyContinue
+
+          $securePassword = $null
